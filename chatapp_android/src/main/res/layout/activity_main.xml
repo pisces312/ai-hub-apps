@@ -19,6 +19,16 @@
         android:layout_centerVertical="true">
 
     <Button
+        android:id="@+id/set_model_path"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="14sp"
+        android:text="@string/set_model_path"
+        android:gravity="center"
+        android:layout_gravity="center"
+        android:layout_marginTop="16dp" />
+
+    <Button
         android:id="@+id/llm"
         android:layout_width="wrap_content"
         android:layout_height="60dp"

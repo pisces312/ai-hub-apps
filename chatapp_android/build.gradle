@@ -1,4 +1,5 @@
-import java.nio.file.Paths
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 plugins {
     id 'com.android.application' version '8.13.0'
@@ -15,15 +16,82 @@ if (file('_shared/android/common.gradle').exists()) {
 //      "C:\\Qualcomm\\AIStack\\QAIRT\\2.33.0.250327"
 def qnnSDKLocalPath= System.getenv("QAIRT_PATH") ?: "<SET QAIRT SDK PATH>"   // <-- Please add QNN SDK root path
 
-// List of model assets
-def models = ["llm"]
-// Relative asset path for model configuration and binaries
-def relAssetsPath = "src/main/assets/models"
 def buildDir = project.getLayout().getBuildDirectory()
 def libsDir = buildDir.dir("libs")
 
+// Resolve at configuration time for configuration cache compatibility
+def qnnSDKPath = qnnSDKLocalPath
+def htpVerProp = project.hasProperty('htpVersion') ? project.property('htpVersion') : null
+
+// Register a proper task for copying QNN libs (configuration-cache compatible)
+abstract class CopyQnnLibs extends DefaultTask {
+    @Input String qnnSdkPath
+    @Input @Optional String htpVersion
+    @OutputDirectory abstract DirectoryProperty getOutputDir()
+
+    @TaskAction
+    void copy() {
+        if (!qnnSdkPath) {
+            throw new RuntimeException("Please download QAIRT SDK and set `qnnSDKLocalPath` in build.gradle.");
+        }
+
+        def sdkDir = new File(qnnSdkPath)
+        if (!sdkDir.exists()) {
+            throw new RuntimeException("QAIRT SDK does not exist at ${sdkDir.absolutePath}.");
+        }
+
+        def genieLibFile = new File(qnnSdkPath, "lib/aarch64-android/libGenie.so")
+        if (!genieLibFile.exists()) {
+            throw new RuntimeException("libGenie.so does not exist. Expected at ${genieLibFile.absolutePath}");
+        }
+
+        def outDir = outputDir.get().asFile
+        outDir.mkdirs()
+
+        def requiredLibs = [
+            "lib/aarch64-android/libQnnHtp.so",
+            "lib/aarch64-android/libQnnHtpPrepare.so",
+            "lib/aarch64-android/libQnnSystem.so",
+            "lib/aarch64-android/libQnnSaver.so",
+        ]
+
+        def libDir = new File(qnnSdkPath, "lib")
+        if (htpVersion) {
+            def skel = new File(libDir, "hexagon-v${htpVersion}/unsigned/libQnnHtpV${htpVersion}Skel.so")
+            if (skel.exists()) requiredLibs << skel.path.replace(qnnSdkPath + File.separator, "")
+            def stub = new File(libDir, "aarch64-android/libQnnHtpV${htpVersion}Stub.so")
+            if (stub.exists()) requiredLibs << stub.path.replace(qnnSdkPath + File.separator, "")
+        } else {
+            libDir.eachDir { dir ->
+                if (dir.name.startsWith("hexagon-v")) {
+                    def ver = dir.name.replace("hexagon-", "")
+                    def skelFile = new File(dir, "unsigned/libQnnHtp${ver.capitalize()}Skel.so")
+                    if (skelFile.exists()) requiredLibs << skelFile.path.replace(qnnSdkPath + File.separator, "")
+                }
+            }
+            new File(libDir, "aarch64-android").eachFileMatch(~/libQnnHtpV.*Stub\.so/) { f ->
+                requiredLibs << f.path.replace(qnnSdkPath + File.separator, "")
+            }
+        }
+
+        requiredLibs.each { relPath ->
+            def src = new File(qnnSdkPath, relPath)
+            if (!src.exists()) {
+                throw new RuntimeException("Required lib not found: ${src.absolutePath}")
+            }
+            Files.copy(src.toPath(), new File(outDir, src.name).toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+}
+
+tasks.register('copyQnnLibs', CopyQnnLibs) {
+    qnnSdkPath = qnnSDKPath
+    htpVersion = htpVerProp
+    outputDir = buildDir.dir("libs/arm64-v8a")
+}
+
 android {
-    ndkVersion '27.3.13750724'
+    ndkVersion '27.0.12077973'
     compileSdk 34
 
     defaultConfig {
@@ -43,6 +111,9 @@ android {
         sourceSets {
             main {
                 jniLibs.srcDir libsDir
+                assets {
+                    srcDir 'src/main/assets'
+                }
             }
         }
         signingConfig signingConfigs.debug
@@ -73,54 +144,13 @@ android {
     aaptOptions {
         noCompress "bin", "json"
     }
+}
 
-    preBuild.doFirst {
-        if (!qnnSDKLocalPath) {
-            throw new RuntimeException("Please download QAIRT SDK and set `qnnSDKLocalPath` in build.gradle.");
-        }
-
-        // Check if QNN SDK is set correctly
-        def qnnSDKFile = file(qnnSDKLocalPath)
-        if (!qnnSDKFile.exists()) {
-            throw new RuntimeException("QAIRT SDK does not exist at $qnnSDKFile.absolutePath.");
-        }
-
-        // Copy required QNN libs
-        def genieLibFile = file(Paths.get(qnnSDKLocalPath, "lib", "aarch64-android", "libGenie.so"))
-        if (!genieLibFile.exists()) {
-            throw new RuntimeException("libGenie.so does not exist. Expected at $genieLibFile.absolutePath");
-        }
-
-        // Ensure genie config and tokenizer are present
-        models.each { model ->
-            def configFile = file(Paths.get(relAssetsPath, model, "genie_config.json"))
-            if (!configFile.exists()) {
-                throw new RuntimeException("Missing genie_config.json for $model. Expected at $configFile.absolutePath")
-            }
-            def tokenizerFile = file(Paths.get(relAssetsPath, model, "tokenizer.json"))
-            if (!tokenizerFile.exists()) {
-                throw new RuntimeException("Missing tokenizer.json for $model. Expected at $tokenizerFile.absolutePath")
-            }
-        }
-
-        def libsABIDir = buildDir.dir("libs/arm64-v8a")
-        copy {
-            from qnnSDKLocalPath
-
-            include "**/lib/aarch64-android/libQnnHtp.so"
-            include "**/lib/aarch64-android/libQnnHtpPrepare.so"
-            include "**/lib/aarch64-android/libQnnSystem.so"
-            include "**/lib/aarch64-android/libQnnSaver.so"
-            include "**/lib/hexagon-v**/unsigned/libQnnHtpV**Skel.so"
-            include "**/lib/aarch64-android/libQnnHtpV**Stub.so"
-
-            into libsABIDir
-            // Copy libraries without directory structure
-            eachFile {
-                path = name
-            }
-            includeEmptyDirs = false
-        }
+// Wire copyQnnLibs to run before native lib merge
+def qnnDependentTasks = ['mergeDebugJniLibFolders', 'mergeReleaseJniLibFolders', 'mergeDebugNativeLibs', 'mergeReleaseNativeLibs'] as Set
+tasks.configureEach { task ->
+    if (task.name in qnnDependentTasks) {
+        task.dependsOn 'copyQnnLibs'
     }
 }
 

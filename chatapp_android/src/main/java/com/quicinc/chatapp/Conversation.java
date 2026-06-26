@@ -33,6 +33,7 @@ public class Conversation extends AppCompatActivity {
     private static final String cWelcomeMessage = "Hi! How can I help you?";
     public static final String cConversationActivityKeyHtpConfig = "htp_config_path";
     public static final String cConversationActivityKeyModelName = "model_dir_name";
+    public static final String cConversationActivityKeyModelDir = "model_dir_path";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -72,8 +73,12 @@ public class Conversation extends AppCompatActivity {
 
             String htpExtensionsDir = bundle.getString(cConversationActivityKeyHtpConfig);
             String modelName = bundle.getString(cConversationActivityKeyModelName);
-            String externalCacheDir = this.getExternalCacheDir().getAbsolutePath().toString();
-            String modelDir = Paths.get(externalCacheDir, "models", modelName).toString();
+            String modelDir = bundle.getString(cConversationActivityKeyModelDir);
+            if (modelDir == null || modelDir.isEmpty()) {
+                // Fallback to legacy behavior for backward compatibility
+                String externalCacheDir = this.getExternalCacheDir().getAbsolutePath();
+                modelDir = Paths.get(externalCacheDir, "models", modelName).toString();
+            }
 
             // Load Model
             GenieWrapper genieWrapper = new GenieWrapper(modelDir, htpExtensionsDir);
