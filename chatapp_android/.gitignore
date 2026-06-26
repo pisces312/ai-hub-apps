@@ -1,0 +1,18 @@
+# Gradle
+.gradle/
+build/
+
+# CMake
+.cxx/
+
+# Python
+.venv/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# Project
+.workbuddy/
+src/main/cpp/json.hpp

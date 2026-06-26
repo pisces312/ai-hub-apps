@@ -10,30 +10,31 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.app.AlertDialog;
+import android.widget.Button;
 import android.widget.EditText;
-import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
 import android.os.Bundle;
 import android.util.Log;
-import android.view.View;
-import android.widget.Button;
-import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -41,12 +42,10 @@ public class MainActivity extends AppCompatActivity {
         System.loadLibrary("chatapp");
     }
 
-    /**
-     * copyAssetsDir: Copies provided assets to output path
-     */
-    void copyAssetsDir(String inputAssetRelPath, String outputPath) throws IOException, NullPointerException {
-        File outputAssetPath = new File(Paths.get(outputPath, inputAssetRelPath).toString());
+    // --- asset helpers --------------------------------------------------------
 
+    void copyAssetsDir(String inputAssetRelPath, String outputPath) throws IOException {
+        File outputAssetPath = new File(Paths.get(outputPath, inputAssetRelPath).toString());
         String[] subAssetList = this.getAssets().list(inputAssetRelPath);
         if (subAssetList.length == 0) {
             if (!outputAssetPath.exists()) {
@@ -54,20 +53,17 @@ public class MainActivity extends AppCompatActivity {
             }
             return;
         }
-
         if (!outputAssetPath.exists()) {
             outputAssetPath.mkdirs();
         }
         for (String subAssetName : subAssetList) {
-            String input_sub_asset_path = Paths.get(inputAssetRelPath, subAssetName).toString();
-            copyAssetsDir(input_sub_asset_path, outputPath);
+            copyAssetsDir(Paths.get(inputAssetRelPath, subAssetName).toString(), outputPath);
         }
     }
 
     void copyFile(String inputFilePath, File outputAssetFile) throws IOException {
         InputStream in = this.getAssets().open(inputFilePath);
         OutputStream out = new FileOutputStream(outputAssetFile);
-
         byte[] buffer = new byte[1024 * 1024];
         int read;
         while ((read = in.read(buffer)) != -1) {
@@ -75,50 +71,180 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private static final String PREFS_NAME = "chatapp_prefs";
-    private static final String KEY_MODEL_PATH = "model_path";
+    // --- constants ------------------------------------------------------------
 
-    // SAF directory picker for model path selection
+    private static final String PREFS_NAME = "chatapp_prefs";
+    private static final String KEY_MODEL_BASE_PATH = "model_base_path";
+
+    // SAF directory picker
     private final ActivityResultLauncher<Uri> storageDirPicker =
         registerForActivityResult(new ActivityResultContracts.OpenDocumentTree(), uri -> {
             if (uri != null) {
                 String path = getPathFromTreeUri(uri);
                 if (path != null) {
-                    saveAndApplyModelPath(path);
+                    saveBasePath(path);
                 } else {
                     Toast.makeText(this, "Cannot determine path. Try manual input.", Toast.LENGTH_LONG).show();
                 }
             }
         });
 
+    // --- model discovery ------------------------------------------------------
+
     private boolean isValidModelDir(String path) {
         if (path == null || path.isEmpty()) return false;
-        File configFile = new File(Paths.get(path, "genie_config.json").toString());
-        return configFile.exists();
+        return new File(Paths.get(path, "genie_config.json").toString()).exists();
     }
 
-    /**
-     * Three-option dialog: Browse (SAF) / Type Path / Clear
-     */
+    private String readModelDisplayName(String modelDir) {
+        File metaFile = new File(Paths.get(modelDir, "metadata.json").toString());
+        if (metaFile.exists()) {
+            try {
+                String content = new String(Files.readAllBytes(metaFile.toPath()));
+                org.json.JSONObject meta = new org.json.JSONObject(content);
+                if (meta.has("model_name")) {
+                    return meta.getString("model_name");
+                }
+            } catch (Exception e) {
+                Log.w("ChatApp", "Failed to read metadata.json: " + e.getMessage());
+            }
+        }
+        return null;
+    }
+
+    private List<ModelInfo> discoverModels(String basePath) {
+        List<ModelInfo> result = new ArrayList<>();
+        File base = new File(basePath);
+        if (!base.isDirectory()) return result;
+
+        File[] children = base.listFiles();
+        if (children == null) return result;
+
+        for (File child : children) {
+            if (!child.isDirectory()) continue;
+            String subDir = child.getName();
+            String fullPath = child.getAbsolutePath();
+            if (isValidModelDir(fullPath)) {
+                String displayName = readModelDisplayName(fullPath);
+                if (displayName == null) displayName = subDir;
+                result.add(new ModelInfo(subDir, displayName, fullPath));
+            }
+        }
+        return result;
+    }
+
+    // --- UI construction ------------------------------------------------------
+
+    private void buildModelList(List<ModelInfo> models) {
+        // Get HTP config path (only needed once per SoC)
+        String htpConfigPath = getHtpConfigPath();
+        LinearLayout container = findViewById(R.id.models_container);
+        container.removeAllViews();
+
+        if (models.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("No models found. Please set a base path containing models.");
+            empty.setTextSize(14);
+            empty.setPadding(0, 8, 0, 8);
+            container.addView(empty);
+            return;
+        }
+
+        for (ModelInfo info : models) {
+            // Card wrapper
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(0, 8, 0, 24);
+
+            // Model name
+            TextView nameView = new TextView(this);
+            nameView.setText(info.displayName);
+            nameView.setTextSize(18);
+            nameView.setPadding(0, 0, 0, 8);
+            card.addView(nameView);
+
+            // Chat button
+            Button chatBtn = new Button(this);
+            chatBtn.setText("Chat with " + info.displayName);
+            final String modelDir = info.fullPath;
+            final String modelName = info.subDir;
+            final String htpPath = htpConfigPath;
+            chatBtn.setOnClickListener(v -> {
+                Intent intent = new Intent(MainActivity.this, Conversation.class);
+                intent.putExtra(Conversation.cConversationActivityKeyHtpConfig, htpPath);
+                intent.putExtra(Conversation.cConversationActivityKeyModelDir, modelDir);
+                intent.putExtra(Conversation.cConversationActivityKeyModelName, modelName);
+                startActivity(intent);
+            });
+            card.addView(chatBtn);
+
+            container.addView(card);
+        }
+    }
+
+    private String getHtpConfigPath() {
+        HashMap<String, String> socMap = new HashMap<>();
+        socMap.put("SM8850", "qualcomm-snapdragon-8-elite.json");
+        socMap.put("SM8750", "qualcomm-snapdragon-8-elite.json");
+        socMap.put("SM8650", "qualcomm-snapdragon-8-gen3.json");
+        socMap.put("QCS8550", "qualcomm-snapdragon-8-gen2.json");
+
+        String socModel = android.os.Build.SOC_MODEL;
+        String htpFile = socMap.getOrDefault(socModel, null);
+        if (htpFile == null) return "";
+
+        // Check external cache first, then copy from assets if missing
+        Path cachedPath = Paths.get(getExternalCacheDir().getAbsolutePath(), "htp_config", htpFile);
+        if (!cachedPath.toFile().exists()) {
+            try {
+                copyAssetsDir("htp_config", getExternalCacheDir().getAbsolutePath());
+            } catch (IOException e) {
+                Log.w("ChatApp", "Failed to copy htp_config: " + e.getMessage());
+            }
+        }
+        return cachedPath.toString();
+    }
+
+    private void updateBasePathLabel(String path) {
+        TextView label = findViewById(R.id.base_path_label);
+        if (path != null && !path.isEmpty()) {
+            label.setText(path);
+        } else {
+            label.setText("No base path set");
+        }
+    }
+
+    private void refreshModelList() {
+        String basePath = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(KEY_MODEL_BASE_PATH, "");
+        updateBasePathLabel(basePath);
+
+        if (!basePath.isEmpty()) {
+            List<ModelInfo> models = discoverModels(basePath);
+            buildModelList(models);
+        } else {
+            buildModelList(new ArrayList<>());
+        }
+    }
+
+    // --- path selection dialogs -----------------------------------------------
+
     private void showModelPathDialog() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String currentPath = prefs.getString(KEY_MODEL_PATH, "");
+        String currentPath = prefs.getString(KEY_MODEL_BASE_PATH, "");
 
         String message = currentPath.isEmpty()
-            ? "No model path configured."
+            ? "No base path configured."
             : "Current: " + currentPath;
 
         new AlertDialog.Builder(this)
-            .setTitle("Set Model Directory")
+            .setTitle("Set Model Base Directory")
             .setMessage(message)
-            .setPositiveButton("Browse", (dialog, which) -> {
-                storageDirPicker.launch(null);
-            })
-            .setNeutralButton("Type Path", (dialog, which) -> {
-                showManualPathInput();
-            })
-            .setNegativeButton("Clear", (dialog, which) -> {
-                prefs.edit().remove(KEY_MODEL_PATH).apply();
+            .setPositiveButton("Browse", (d, w) -> storageDirPicker.launch(null))
+            .setNeutralButton("Type Path", (d, w) -> showManualPathInput())
+            .setNegativeButton("Clear", (d, w) -> {
+                prefs.edit().remove(KEY_MODEL_BASE_PATH).apply();
+                refreshModelList();
                 Toast.makeText(this, "Cleared.", Toast.LENGTH_SHORT).show();
             })
             .show();
@@ -126,41 +252,33 @@ public class MainActivity extends AppCompatActivity {
 
     private void showManualPathInput() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String currentPath = prefs.getString(KEY_MODEL_PATH, "");
+        String currentPath = prefs.getString(KEY_MODEL_BASE_PATH, "");
 
         final EditText input = new EditText(this);
         input.setText(currentPath);
-        input.setHint("e.g., /sdcard/ChatApp/models/llm");
+        input.setHint("e.g., /sdcard/ChatApp/models");
         input.setSingleLine();
 
         new AlertDialog.Builder(this)
-            .setTitle("Enter Model Path")
+            .setTitle("Enter Base Path")
             .setView(input)
-            .setPositiveButton("OK", (dialog, which) -> {
+            .setPositiveButton("OK", (d, w) -> {
                 String path = input.getText().toString().trim();
                 if (!path.isEmpty()) {
-                    saveAndApplyModelPath(path);
+                    saveBasePath(path);
                 }
             })
             .setNegativeButton("Cancel", null)
             .show();
     }
 
-    private void saveAndApplyModelPath(String path) {
-        if (isValidModelDir(path)) {
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putString(KEY_MODEL_PATH, path).apply();
-            Toast.makeText(this, "Model path set. Restarting...", Toast.LENGTH_SHORT).show();
-            recreate();
-        } else {
-            Toast.makeText(this,
-                "genie_config.json not found at " + path, Toast.LENGTH_LONG).show();
-        }
+    private void saveBasePath(String path) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(KEY_MODEL_BASE_PATH, path).apply();
+        refreshModelList();
+        Toast.makeText(this, "Base path set.", Toast.LENGTH_SHORT).show();
     }
 
-    /**
-     * Extract real filesystem path from a SAF tree URI.
-     */
     private String getPathFromTreeUri(Uri treeUri) {
         try {
             String docId = DocumentsContract.getTreeDocumentId(treeUri);
@@ -179,9 +297,8 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Request MANAGE_EXTERNAL_STORAGE at startup (MNN-style).
-     */
+    // --- permission -----------------------------------------------------------
+
     private void checkStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
@@ -201,96 +318,49 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // --- lifecycle ------------------------------------------------------------
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Request all-files access at startup (like MNN)
         checkStoragePermission();
 
         setContentView(R.layout.activity_main);
 
-        // Set up button listeners (always, regardless of model state)
-        Button setModelPathBtn = (Button) findViewById(R.id.set_model_path);
-        setModelPathBtn.setOnClickListener(view -> showModelPathDialog());
+        // Set Model Path button
+        Button setModelPathBtn = findViewById(R.id.set_model_path);
+        setModelPathBtn.setOnClickListener(v -> showModelPathDialog());
 
+        // Check SoC support
         try {
-            HashMap<String, String> supportedSocModel = new HashMap<>();
-            supportedSocModel.putIfAbsent("SM8850", "qualcomm-snapdragon-8-elite.json");
-            supportedSocModel.putIfAbsent("SM8750", "qualcomm-snapdragon-8-elite.json");
-            supportedSocModel.putIfAbsent("SM8650", "qualcomm-snapdragon-8-gen3.json");
-            supportedSocModel.putIfAbsent("QCS8550", "qualcomm-snapdragon-8-gen2.json");
+            HashMap<String, String> socMap = new HashMap<>();
+            socMap.put("SM8850", "qualcomm-snapdragon-8-elite.json");
+            socMap.put("SM8750", "qualcomm-snapdragon-8-elite.json");
+            socMap.put("SM8650", "qualcomm-snapdragon-8-gen3.json");
+            socMap.put("QCS8550", "qualcomm-snapdragon-8-gen2.json");
 
             String socModel = android.os.Build.SOC_MODEL;
-            if (!supportedSocModel.containsKey(socModel)) {
-                String errorMsg = "Unsupported device: " + socModel;
-                Log.e("ChatApp", errorMsg);
-                Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show();
+            if (!socMap.containsKey(socModel)) {
+                Toast.makeText(this, "Unsupported device: " + socModel, Toast.LENGTH_LONG).show();
                 finish();
                 return;
             }
-
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String customModelPath = prefs.getString(KEY_MODEL_PATH, "");
-            String modelDirPath;
-            boolean usingExternalPath = false;
-
-            if (!customModelPath.isEmpty() && isValidModelDir(customModelPath)) {
-                modelDirPath = customModelPath;
-                usingExternalPath = true;
-                Log.i("ChatApp", "Using external model path: " + modelDirPath);
-                Toast.makeText(this, "Using external model: " + modelDirPath, Toast.LENGTH_SHORT).show();
-            } else {
-                String errorMsg = "No model path configured. Please click 'Set Model Path' to configure.";
-                Log.e("ChatApp", errorMsg);
-                Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show();
-                return;
-            }
-            Path htpExtConfigPath = Paths.get(getExternalCacheDir().getAbsolutePath(), "htp_config", supportedSocModel.get(socModel));
-
-            if (usingExternalPath && !htpExtConfigPath.toFile().exists()) {
-                String externalDir = getExternalCacheDir().getAbsolutePath();
-                try {
-                    copyAssetsDir("htp_config", externalDir);
-                } catch (IOException e) {
-                    Log.w("ChatApp", "Failed to copy htp_config: " + e.getMessage());
-                }
-                htpExtConfigPath = Paths.get(externalDir, "htp_config", supportedSocModel.get(socModel));
-            }
-
-            String modelName = "No Model Found";
-            File metadataFile = new File(Paths.get(modelDirPath, "metadata.json").toString());
-            if (metadataFile.exists()) {
-                try {
-                    String content = new String(java.nio.file.Files.readAllBytes(metadataFile.toPath()));
-                    org.json.JSONObject metadata = new org.json.JSONObject(content);
-                    if (metadata.has("model_name")) {
-                        modelName = metadata.getString("model_name");
-                    }
-                } catch (Exception e) {
-                    Log.w("ChatApp", "Could not read model_name from metadata.json: " + e.getMessage());
-                }
-            } else {
-                Log.w("ChatApp", "metadata.json not found at: " + metadataFile.getAbsolutePath());
-            }
-            final String finalModelName = modelName;
-            final String finalModelDirPath = modelDirPath;
-            final String finalHtpConfigPath = htpExtConfigPath.toString();
-
-            Button llm = (Button) findViewById(R.id.llm);
-            llm.setText("Chat with " + finalModelName);
-            llm.setOnClickListener(view -> {
-                Intent intent = new Intent(MainActivity.this, Conversation.class);
-                intent.putExtra(Conversation.cConversationActivityKeyHtpConfig, finalHtpConfigPath);
-                intent.putExtra(Conversation.cConversationActivityKeyModelDir, finalModelDirPath);
-                intent.putExtra(Conversation.cConversationActivityKeyModelName, "llm");
-                startActivity(intent);
-            });
         } catch (Exception e) {
-            String errorMsg = "Unexpected error: " + e.toString();
-            Log.e("ChatApp", errorMsg);
-            Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show();
+            Log.e("ChatApp", "SoC check failed: " + e.getMessage());
+            Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show();
             finish();
+            return;
         }
+
+        // Refresh model list from saved base path
+        refreshModelList();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Refresh model list (handles returning from Settings permission grant)
+        refreshModelList();
     }
 }
